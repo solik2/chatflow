@@ -1,0 +1,12 @@
+name: chatflow_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pyqt
+  - pandas
+  - cryptography
+  - pip
+  - pip:
+      - ttkbootstrap
