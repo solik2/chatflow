@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QLineEdit,
     QPushButton, QFileDialog, QMessageBox, QStackedWidget
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QMetaObject, Q_ARG
 
 HOST = '127.0.0.1'
 PORT = 1234
@@ -90,43 +90,62 @@ class ChatFlowClient(QMainWindow):
         return widget
 
     def login(self):
+        print("[DEBUG] Attempting login")
         self.auth_mode = 'Login'
         self.username = self.loginUserField.text()
         self.password = self.loginPassField.text()
+        print(f"[DEBUG] Username: {self.username}, Password: {self.password}")
         threading.Thread(target=self.receive).start()
 
     def signup(self):
+        print("[DEBUG] Attempting signup")
         self.auth_mode = 'Register'
         self.username = self.signupUserField.text()
         self.email = self.signupEmailField.text()
         self.password = self.signupPassField.text()
+        print(f"[DEBUG] Username: {self.username}, Email: {self.email}, Password: {self.password}")
         threading.Thread(target=self.receive).start()
 
     def receive(self):
+        print("[DEBUG] Starting to receive messages")
         try:
             while True:
                 message = client.recv(1024).decode()
+                print(f"[DEBUG] Message received: {message}")
                 if message == 'Login or Reg':
                     client.send(self.auth_mode.encode())
+                    print(f"[DEBUG] Sent auth mode: {self.auth_mode}")
                 elif message == 'USER':
                     client.send(self.username.encode())
+                    print(f"[DEBUG] Sent username: {self.username}")
                 elif message == 'PW':
                     client.send(self.password.encode())
+                    print(f"[DEBUG] Sent password")
                 elif message == 'EMAIL':
                     client.send(self.email.encode())
+                    print(f"[DEBUG] Sent email: {self.email}")
                 elif message == 'Authenticated':
                     self.show_message("Success", "Login successful!")
+                    print("[DEBUG] Login successful")
+                    break
+                elif message == 'Registration Successful':
+                    self.show_message("Success", "Registration successful!")
+                    print("[DEBUG] Registration successful")
                     break
                 elif message == 'Authentication Failed':
                     self.show_message("Failed", "Login failed.")
+                    print("[DEBUG] Login failed")
                     break
                 else:
-                    print(message)
+                    print(f"[DEBUG] Other message: {message}")
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"[DEBUG] Error: {e}")
 
     def show_message(self, title, text):
-        QMessageBox.information(self, title, text)
+        def display():
+            QMessageBox.information(self, title, text)
+
+        QMetaObject.invokeMethod(self, "", Qt.QueuedConnection, Q_ARG(str, title), Q_ARG(str, text))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

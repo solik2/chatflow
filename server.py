@@ -9,7 +9,7 @@ import logging
 from cryptography.fernet import Fernet, InvalidToken
 
 # ------------------- configuration -------------------
-HOST = ''
+HOST = '127.0.0.1'
 PORT = 1234
 MAX_MSG_LEN = 1024       # hard socket read cap
 MAX_FIELD_LEN = 256      # individual field length cap
@@ -30,16 +30,19 @@ logging.basicConfig(
 # ---------------- encryption key ---------------------
 def load_or_create_key() -> bytes:
     try:
+        print("[DEBUG] Loading or creating encryption key")
         if os.path.exists(KEY_FILE):
             with open(KEY_FILE, 'rb') as kf:
                 key = kf.read()
             # 44-byte urlsafe base64 key check
             if len(key) == 44:
+                print("[DEBUG] Key loaded successfully")
                 return key
             logging.warning("Invalid key length; regenerating.")
         key = Fernet.generate_key()
         with open(KEY_FILE, 'wb') as kf:
             kf.write(key)
+        print("[DEBUG] New key generated and saved")
         return key
     except Exception as e:
         logging.error(f"Key load/create error: {e}")
@@ -94,10 +97,13 @@ def decrypt_try(blob: bytes) -> bytes:
         return b''
 
 def recv_decoded(sock) -> str:
+    print("[DEBUG] Receiving data from socket")
     raw = sock.recv(MAX_MSG_LEN)
     if not raw:
+        print("[DEBUG] No data received")
         return ''
     plain = decrypt_try(raw) or raw  # fallback to plaintext
+    print(f"[DEBUG] Data received: {plain[:50]}...")
     return plain.decode(errors='ignore')[:MAX_FIELD_LEN]
 
 def send_plain(sock, msg: str):
@@ -133,12 +139,15 @@ server.listen()
 clients: dict[socket.socket, str] = {}
 
 def handle_client(cli: socket.socket):
+    print("[DEBUG] Handling new client")
     try:
         while True:
             decoded = recv_decoded(cli)
             if not decoded:
+                print("[DEBUG] Client disconnected")
                 break
 
+            print(f"[DEBUG] Message from client: {decoded}")
             if decoded == 'File Transfer':
                 send_plain(cli, 'Send File Name')
                 filename = sanitize(recv_decoded(cli))
@@ -153,6 +162,7 @@ def handle_client(cli: socket.socket):
                         if decrypt_try(chunk) == b'Completed':
                             break
                         f.write(decrypt_try(chunk) or chunk)
+                print(f"[DEBUG] File {filename} received")
                 continue
 
             if ':' in decoded:
@@ -165,6 +175,7 @@ def handle_client(cli: socket.socket):
         username = clients.pop(cli, 'Unknown')
         broadcast(f"{username} left the chat!")
         cli.close()
+        print("[DEBUG] Client handler closed")
 
 def login(username, password, cli) -> bool:
     row = userdata_df[userdata_df['username'] == username]
@@ -190,6 +201,7 @@ def register(username, email, password, cli) -> bool:
                            columns=['username', 'email', 'password'])
     userdata_df = pd.concat([userdata_df, new_row], ignore_index=True)
     save_user_data()
+    send_plain(cli, 'Registration Successful')  # Added success message
     return True
 # -----------------------------------------------------
 
