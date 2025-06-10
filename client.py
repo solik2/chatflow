@@ -8,9 +8,9 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QLineEdit,
     QPushButton, QFileDialog, QMessageBox, QStackedWidget
 )
-from PyQt5.QtCore import Qt, QMetaObject, Q_ARG
+from PyQt5.QtCore import Qt
 
-HOST = '127.0.0.1'
+HOST = '192.168.0.106'
 PORT = 1234
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 client.connect((HOST, PORT))
@@ -25,6 +25,7 @@ class ChatFlowClient(QMainWindow):
         self.password = ''
         self.email = ''
         self.auth_mode = 'Login'
+        self.is_authenticated = False  # Add a state variable to track authentication
 
         self.stack = QStackedWidget(self)
         self.setCentralWidget(self.stack)
@@ -112,7 +113,9 @@ class ChatFlowClient(QMainWindow):
             while True:
                 message = client.recv(1024).decode()
                 print(f"[DEBUG] Message received: {message}")
-                if message == 'Login or Reg':
+                if message == '':
+                    pass
+                elif message == 'Login or Reg':
                     client.send(self.auth_mode.encode())
                     print(f"[DEBUG] Sent auth mode: {self.auth_mode}")
                 elif message == 'USER':
@@ -125,28 +128,27 @@ class ChatFlowClient(QMainWindow):
                     client.send(self.email.encode())
                     print(f"[DEBUG] Sent email: {self.email}")
                 elif message == 'Authenticated':
+                    self.is_authenticated = True  # Set authentication state
                     self.show_message("Success", "Login successful!")
                     print("[DEBUG] Login successful")
-                    break
                 elif message == 'Registration Successful':
+                    self.is_authenticated = True  # Set authentication state
                     self.show_message("Success", "Registration successful!")
                     print("[DEBUG] Registration successful")
-                    break
                 elif message == 'Authentication Failed':
                     self.show_message("Failed", "Login failed.")
                     print("[DEBUG] Login failed")
-                    break
+                    break  # Exit loop on failed authentication
+                elif self.is_authenticated:
+                    # Handle post-authentication messages (e.g., chat messages)
+                    print(f"[CHAT] {message}")
                 else:
                     print(f"[DEBUG] Other message: {message}")
         except Exception as e:
             print(f"[DEBUG] Error: {e}")
 
     def show_message(self, title, text):
-        def display():
-            QMessageBox.information(self, title, text)
-
-        QMetaObject.invokeMethod(self, "", Qt.QueuedConnection, Q_ARG(str, title), Q_ARG(str, text))
-
+        QMessageBox.information(self, title, text)
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = ChatFlowClient()

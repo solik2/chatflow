@@ -9,7 +9,7 @@ import logging
 from cryptography.fernet import Fernet, InvalidToken
 
 # ------------------- configuration -------------------
-HOST = '127.0.0.1'
+HOST = '192.168.0.106'
 PORT = 1234
 MAX_MSG_LEN = 1024       # hard socket read cap
 MAX_FIELD_LEN = 256      # individual field length cap
@@ -106,8 +106,11 @@ def recv_decoded(sock) -> str:
     print(f"[DEBUG] Data received: {plain[:50]}...")
     return plain.decode(errors='ignore')[:MAX_FIELD_LEN]
 
-def send_plain(sock, msg: str):
-    sock.send(msg.encode())
+# ---------- server.py ----------
+def send_plain(sock: socket.socket, msg: str) -> None:
+    """Send ONE logical message framed with '\n'."""
+    sock.sendall(f"{msg}".encode("utf-8"))
+
 # -----------------------------------------------------
 
 # ------------------ core functions -------------------
