@@ -1,156 +1,103 @@
-# chatflow_pyqt_client.py
+#!/usr/bin/env python3
+"""
+Terminal-only ChatFlow client.
+Re-implements the old GUI logic using stdin/stdout and keeps the
+handshake that the server already understands:
 
-import sys
+  • Server → "Login or Reg"         → client sends "Login"/"Register"
+  • Server → "USER" / "PW" / "EMAIL"→ client replies with credentials
+  • Server → auth result strings    → client prints status
+
+After authentication every line you enter is sent as a chat message.
+Type  `exit`  or  `quit`  to close the connection.
+"""
+
+import argparse
+import getpass
 import socket
 import threading
-import os
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QLineEdit,
-    QPushButton, QFileDialog, QMessageBox, QStackedWidget
-)
-from PyQt5.QtCore import Qt
+import sys
 
-HOST = '192.168.0.106'
-PORT = 1234
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect((HOST, PORT))
+BUF_SIZE = 1024
+HOST, PORT = "192.168.0.106", 1234
 
-class ChatFlowClient(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("ChatFlow Login")
-        self.setFixedSize(500, 400)
-
-        self.username = ''
-        self.password = ''
-        self.email = ''
-        self.auth_mode = 'Login'
-        self.is_authenticated = False  # Add a state variable to track authentication
-
-        self.stack = QStackedWidget(self)
-        self.setCentralWidget(self.stack)
-
-        self.loginWidget = self.build_login_ui()
-        self.signupWidget = self.build_signup_ui()
-
-        self.stack.addWidget(self.loginWidget)
-        self.stack.addWidget(self.signupWidget)
-
-    def build_login_ui(self):
-        widget = QWidget()
-        layout = QVBoxLayout()
-
-        layout.addWidget(QLabel("Login to ChatFlow", alignment=Qt.AlignCenter))
-        self.loginUserField = QLineEdit()
-        self.loginUserField.setPlaceholderText("Username")
-        layout.addWidget(self.loginUserField)
-
-        self.loginPassField = QLineEdit()
-        self.loginPassField.setPlaceholderText("Password")
-        self.loginPassField.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.loginPassField)
-
-        loginBtn = QPushButton("Login")
-        loginBtn.clicked.connect(self.login)
-        layout.addWidget(loginBtn)
-
-        signupLink = QPushButton("Sign Up")
-        signupLink.clicked.connect(lambda: self.stack.setCurrentWidget(self.signupWidget))
-        layout.addWidget(signupLink)
-
-        widget.setLayout(layout)
-        return widget
-
-    def build_signup_ui(self):
-        widget = QWidget()
-        layout = QVBoxLayout()
-
-        layout.addWidget(QLabel("Sign Up to ChatFlow", alignment=Qt.AlignCenter))
-        self.signupUserField = QLineEdit()
-        self.signupUserField.setPlaceholderText("Username")
-        layout.addWidget(self.signupUserField)
-
-        self.signupEmailField = QLineEdit()
-        self.signupEmailField.setPlaceholderText("Email")
-        layout.addWidget(self.signupEmailField)
-
-        self.signupPassField = QLineEdit()
-        self.signupPassField.setPlaceholderText("Password")
-        self.signupPassField.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.signupPassField)
-
-        confirmBtn = QPushButton("Sign Up")
-        confirmBtn.clicked.connect(self.signup)
-        layout.addWidget(confirmBtn)
-
-        cancelBtn = QPushButton("Cancel")
-        cancelBtn.clicked.connect(lambda: self.stack.setCurrentWidget(self.loginWidget))
-        layout.addWidget(cancelBtn)
-
-        widget.setLayout(layout)
-        return widget
-
-    def login(self):
-        print("[DEBUG] Attempting login")
-        self.auth_mode = 'Login'
-        self.username = self.loginUserField.text()
-        self.password = self.loginPassField.text()
-        print(f"[DEBUG] Username: {self.username}, Password: {self.password}")
-        threading.Thread(target=self.receive).start()
-
-    def signup(self):
-        print("[DEBUG] Attempting signup")
-        self.auth_mode = 'Register'
-        self.username = self.signupUserField.text()
-        self.email = self.signupEmailField.text()
-        self.password = self.signupPassField.text()
-        print(f"[DEBUG] Username: {self.username}, Email: {self.email}, Password: {self.password}")
-        threading.Thread(target=self.receive).start()
-
-    def receive(self):
-        print("[DEBUG] Starting to receive messages")
+def recv_loop(sock, creds):
+    """Handle all server traffic in a background thread."""
+    while True:
         try:
-            while True:
-                message = client.recv(1024).decode()
-                print(f"[DEBUG] Message received: {message}")
-                if message == '':
-                    pass
-                elif message == 'Login or Reg':
-                    client.send(self.auth_mode.encode())
-                    print(f"[DEBUG] Sent auth mode: {self.auth_mode}")
-                elif message == 'USER':
-                    client.send(self.username.encode())
-                    print(f"[DEBUG] Sent username: {self.username}")
-                elif message == 'PW':
-                    client.send(self.password.encode())
-                    print(f"[DEBUG] Sent password")
-                elif message == 'EMAIL':
-                    client.send(self.email.encode())
-                    print(f"[DEBUG] Sent email: {self.email}")
-                elif message == 'Authenticated':
-                    self.is_authenticated = True  # Set authentication state
-                    self.show_message("Success", "Login successful!")
-                    print("[DEBUG] Login successful")
-                elif message == 'Registration Successful':
-                    self.is_authenticated = True  # Set authentication state
-                    self.show_message("Success", "Registration successful!")
-                    print("[DEBUG] Registration successful")
-                elif message == 'Authentication Failed':
-                    self.show_message("Failed", "Login failed.")
-                    print("[DEBUG] Login failed")
-                    break  # Exit loop on failed authentication
-                elif self.is_authenticated:
-                    # Handle post-authentication messages (e.g., chat messages)
-                    print(f"[CHAT] {message}")
-                else:
-                    print(f"[DEBUG] Other message: {message}")
-        except Exception as e:
-            print(f"[DEBUG] Error: {e}")
+            data = sock.recv(BUF_SIZE)
+            if not data:
+                print("[INFO] Disconnected by server.")
+                break
 
-    def show_message(self, title, text):
-        QMessageBox.information(self, title, text)
+            msg = data.decode().strip()
+            if msg == "Login or Reg":
+                sock.sendall(creds["mode"].encode())
+            elif msg == "USER":
+                sock.sendall(creds["user"].encode())
+            elif msg == "PW":
+                sock.sendall(creds["password"].encode())
+            elif msg in ("Authenticated", "Registration Successful"):
+                print(f"[SUCCESS] {msg}")
+            elif msg == "Authentication Failed":
+                print("[ERROR] Authentication failed; closing client.")
+                sock.close()
+                sys.exit(1)
+            elif msg == "User does not exist":
+                print("[ERROR] The username you entered does not exist.")
+            elif msg == "Incorrect Password":
+                print("[ERROR] The password you entered is incorrect. Please try again.")
+                creds["password"] = getpass.getpass("Password: ").strip()
+                sock.sendall(creds["password"].encode())
+            elif msg == "Invalid registration data":
+                print("[ERROR] Registration failed due to invalid data. Please check your inputs.")
+            elif msg == "User already exist":
+                print("[ERROR] The username is already taken. Please choose a different one.")
+            elif msg == "Bad mode":
+                print("[ERROR] Invalid mode selected. Please restart the client and choose 'Login' or 'Register'.")
+            else:
+                # Display chat history or new chat messages
+                print(msg)
+        except Exception as exc:
+            print(f"[ERROR] {exc}")
+            break
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Terminal ChatFlow client")
+    ap.add_argument("--host", default="127.0.0.1", help="Server IP")
+    ap.add_argument("--port", type=int, default=1234, help="Server TCP port")
+    args = ap.parse_args()
+
+    # Interactive credential gathering
+    mode = input("Type Login or Register: ").strip().title()
+    while mode not in {"Login", "Register"}:
+        mode = input("Please enter exactly 'Login' or 'Register': ").strip().title()
+
+    user = input("Username: ").strip()
+    password = getpass.getpass("Password: ").strip()
+
+    creds = {"mode": mode, "user": user, "password": password}
+
+    # Connect to server
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((HOST, PORT))
+    print(f"[INFO] Connected to {HOST}:{PORT}")
+
+    # Start receiver thread
+    threading.Thread(target=recv_loop, args=(sock, creds), daemon=True).start()
+
+    # Sender loop
+    try:
+        while True:
+            line = input()
+            if line.lower() in {"exit", "quit"}:
+                break
+            sock.sendall(line.encode())
+    finally:
+        sock.close()
+        print("[INFO] Connection closed.")
+
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = ChatFlowClient()
-    window.show()
-    sys.exit(app.exec_())
+    main()
