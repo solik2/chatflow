@@ -19,7 +19,7 @@ import threading
 import sys
 
 BUF_SIZE = 1024
-HOST, PORT = "192.168.0.106", 1234
+HOST, PORT = "192.168.1.63", 1234
 
 def recv_loop(sock, creds):
     """Handle all server traffic in a background thread."""

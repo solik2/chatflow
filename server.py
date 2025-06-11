@@ -9,7 +9,7 @@ import logging
 from cryptography.fernet import Fernet, InvalidToken
 
 # ------------------- configuration -------------------
-HOST = '192.168.0.106'
+HOST = '192.168.1.63'
 PORT = 1234
 MAX_MSG_LEN = 1024       # hard socket read cap
 MAX_FIELD_LEN = 256      # individual field length cap
@@ -256,3 +256,5 @@ while True:
 
     broadcast(f"{username} joined the Chat!")
     threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+
+
