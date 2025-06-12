@@ -1,6 +1,5 @@
 # chatflow_csv_server.py
-import socket
-import threading
+import ssl, socket, threading, logging
 import pandas as pd
 import datetime
 import os
@@ -17,6 +16,8 @@ USER_CSV = 'userdata.csv'
 CHAT_CSV = 'chathistory.csv'
 KEY_FILE = 'fernet.key'
 LOG_FILE = 'server.log'
+TLS_CERT = "tls/server.crt"
+TLS_KEY  = "tls/server.key"
 # -----------------------------------------------------
 
 # --------------------- logging -----------------------
@@ -86,6 +87,32 @@ chathistory_df = safe_csv_load(CHAT_CSV, ['timestamp', 'user', 'message'])
 # -----------------------------------------------------
 
 # ---------------- encryption wrappers ----------------
+def create_tls_socket(base_sock: socket.socket) -> ssl.SSLSocket:
+    """Wrap accepted TCP socket with TLS."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile="tls/server.crt",
+                            keyfile="tls/server.key")
+    return context.wrap_socket(base_sock, server_side=True)
+
+def start_server():
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp.bind((HOST, PORT))
+    tcp.listen()
+    logging.info("TLS chat server listening on %s:%s …", HOST, PORT)
+
+    while True:
+        conn, addr = tcp.accept()
+        try:
+            tls_conn = create_tls_socket(conn)      # ← TLS handshake here
+        except ssl.SSLError as e:
+            logging.warning("TLS handshake failed from %s: %s", addr, e)
+            conn.close()
+            continue
+        threading.Thread(target=handle_client,
+                         args=(tls_conn, addr),
+                         daemon=True).start()
 def decrypt_try(blob: bytes) -> bytes:
     try:
         return fernet.decrypt(blob)
@@ -98,7 +125,7 @@ def recv_decoded(sock) -> str:
     if not raw:
         print("[DEBUG] No data received")
         return ''
-    plain = decrypt_try(raw) or raw  # fallback to plaintext
+    plain = decrypt_try(raw) # fallback to plaintext
     print(f"[DEBUG] Data received: {plain[:50]}...")
     return plain.decode(errors='ignore')[:MAX_FIELD_LEN]
 
@@ -134,9 +161,15 @@ def broadcast(msg: str, username: str = None):
 # -----------------------------------------------------
 
 # --------------- networking / threading --------------
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen()
+
+base_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+base_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+base_sock.bind((HOST, PORT))
+base_sock.listen()
+# 2. TLS context (server-side)
+tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+tls_ctx.load_cert_chain(certfile=TLS_CERT, keyfile=TLS_KEY)
 clients: dict[socket.socket, str] = {}
 
 def handle_client(cli: socket.socket):
@@ -150,6 +183,8 @@ def handle_client(cli: socket.socket):
                 break
 
             print(f"[DEBUG] Message from client: {decoded}")
+            append_chat_history(datetime.datetime.now(), username, decoded)
+
             if decoded == 'File Transfer':
                 send_plain(cli, 'Send File Name')
                 filename = sanitize(recv_decoded(cli))
@@ -169,7 +204,6 @@ def handle_client(cli: socket.socket):
 
             if ':' in decoded:
                 user, msg = map(str.strip, decoded.split(':', 1))
-                append_chat_history(datetime.datetime.now(), user, msg)
             broadcast(decoded, username=username)
     except Exception as e:
         logging.error(f"Client handler error: {e}")
@@ -239,9 +273,14 @@ def authenticate_client(client):
         send_plain(client, 'Authentication Failed')
 
 while True:
-    client, addr = server.accept()
-    logging.info(f"Connected: {addr}")
-
+    raw_cli, addr = base_sock.accept()       
+    try:
+        client = tls_ctx.wrap_socket(raw_cli, server_side=True)
+    except ssl.SSLError as e:
+        logging.warning("TLS handshake failed from %s: %s", addr, e)
+        raw_cli.close()
+        continue
+    logging.info("TLS chat server listening on %s:%s …", HOST, PORT)
     authenticated, username = authenticate_client(client)
     if not authenticated:
         handle_disconnection(client, addr)
