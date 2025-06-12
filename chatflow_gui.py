@@ -1,108 +1,96 @@
 #!/usr/bin/env python3
 """
-Tkinter chat client with a dark theme.
-
-✓ First screen:  Login / Register form
-✓ After success: Scrollable chat + entry box
-✓ Background thread keeps the socket alive and pushes
-  incoming text into a thread-safe queue that the UI polls.
+Tkinter-based TLS chat client (GUI only, no Fernet).
 
 Requires:
     pip install ttkbootstrap
 """
 
-import socket, threading, queue, sys, ssl
-import ttkbootstrap as ttk
+import ssl, socket, threading, queue, pathlib, ttkbootstrap as ttk, tkinter as tk
 from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledText
-from pathlib import Path
-from getpass import getpass   # fallback for CLI if GUI fails
-from functools import partial
-import tkinter as tk 
+from ttkbootstrap.dialogs import Messagebox          # ← correct import
 
-# -------------- configuration -----------------
-HOST, PORT = "192.168.1.63", 1234        # edit or pass via CLI
-BUF = 1024
-CA_CERT = "tls/ca.crt"
-# ----------------------------------------------
+# ---------- configuration ----------
+HOST, PORT = "192.168.1.63", 1234
+BUF        = 1024
+TLS_DIR    = pathlib.Path(__file__).parent / "tls"
+# -----------------------------------
 
+# ────────────────────────── networking ──────────────────────────
 class ChatClient(threading.Thread):
-    """Networking layer → puts messages into q, reads from send_q."""
+    """Background thread managing the TLS socket."""
     def __init__(self, creds, msg_q, send_q):
         super().__init__(daemon=True)
         self.creds, self.q, self.send_q = creds, msg_q, send_q
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    # ------- helpers mirroring old terminal client -------
-    def _dispatch_server_prompt(self, msg):
-        if msg == "Login or Reg":
-            self.sock.sendall(self.creds["mode"].encode())
-        elif msg == "USER":
-            self.sock.sendall(self.creds["user"].encode())
-        elif msg == "PW":
-            self.sock.sendall(self.creds["password"].encode())
-        else:
-            return False
-        return True
-    # ------------------------------------------------------
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.load_verify_locations(cafile=str(TLS_DIR / "ca.crt"))
+        raw  = socket.create_connection((HOST, PORT))
+        self.sock = ctx.wrap_socket(raw, server_hostname=HOST)
 
+    # helper: always newline-terminate outbound protocol messages
+    def _writeline(self, txt: str):
+        self.sock.sendall(f"{txt}\n".encode())
+
+    # match server prompts during login/registration
+    def _dispatch_prompt(self, line: str) -> bool:
+        if   line == "Login or Reg":
+            self._writeline(self.creds["mode"]);    return True
+        elif line == "USER":
+            self._writeline(self.creds["user"]);    return True
+        elif line == "PW":
+            self._writeline(self.creds["password"]);return True
+        return False
+
+    # main thread loop: read from GUI queue → socket
     def run(self):
+        threading.Thread(target=self._recv_loop, daemon=True).start()
         try:
-            # 1. Plain TCP socket
-            raw_sock = socket.create_connection((HOST, PORT))
-            # 2. SSL context for server-authenticated TLS
-            ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH,cafile=CA_CERT)
-            ctx.check_hostname = False             # LAN: no DNS; disable hostname match
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            # 3. TLS-wrapped socket
-            self.sock = ctx.wrap_socket(raw_sock, server_hostname="chatserver.local")
-            # 4. Connect and perform handshake
-            self.q.put(("info", f"Connected to {HOST}:{PORT}"))
-
-            # receiver loop
-            recv_t = threading.Thread(target=self._recv_loop, daemon=True)
-            recv_t.start()
-
-            # sender loop
             while True:
-                line = self.send_q.get()
-                if line in {"exit", "quit"}:
+                msg = self.send_q.get()
+                if msg in {"exit", "quit"}:
                     break
-                self.sock.sendall(line.encode())
+                self._writeline(msg)
         finally:
             self.sock.close()
             self.q.put(("info", "Disconnected"))
 
+    # secondary loop: socket → GUI queue
     def _recv_loop(self):
+        buffer = ""
         while True:
-            try:
-                data = self.sock.recv(BUF)
-                if not data:
-                    break
-                msg = data.decode().strip()
-
-                # handshake prompts
-                if self._dispatch_server_prompt(msg):
-                    continue
-
-                # auth result or chat content
-                self.q.put(("chat", msg))
-            except ssl.SSLError as e:
-                print("TLS error:", e)
-                self.disconnect()
-                return
-            except OSError:
+            chunk = self.sock.recv(BUF)
+            if not chunk:
                 break
+            buffer += chunk.decode()
+            # process complete lines, keep remainder in buffer
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if self._dispatch_prompt(line):
+                    continue
+                if line == "Authenticated":
+                    self.q.put(("auth_ok", None))
+                elif line in {
+                    "User does not exist", "Incorrect Password",
+                    "Invalid registration data", "User already exist"
+                }:
+                    self.q.put(("auth_err", line))
+                else:
+                    self.q.put(("chat", line))
 
+# ────────────────────────── GUI widgets ──────────────────────────
 class LoginFrame(ttk.Frame):
-    """First screen: collects creds, starts ChatClient."""
+    """Collects credentials and spawns ChatClient."""
     def __init__(self, master, start_chat_cb):
         super().__init__(master, padding=30)
         self.start_chat_cb = start_chat_cb
         ttk.Label(self, text="ChatFlow", font=("Helvetica", 20, "bold")).pack(pady=10)
 
         self.mode = ttk.StringVar(value="Login")
-        ttk.Radiobutton(self, text="Login", variable=self.mode, value="Login").pack(side=LEFT, padx=5)
+        ttk.Radiobutton(self, text="Login",    variable=self.mode, value="Login").pack(side=LEFT, padx=5)
         ttk.Radiobutton(self, text="Register", variable=self.mode, value="Register").pack(side=LEFT)
 
         self.user_entry = ttk.Entry(self, width=25)
@@ -114,24 +102,22 @@ class LoginFrame(ttk.Frame):
         ttk.Button(self, text="Connect", command=self._submit).pack(pady=20)
 
     def _submit(self):
-        creds = {
-            "mode": self.mode.get(),
-            "user": self.user_entry.get().strip(),
-            "password": self.pass_entry.get().strip()
-        }
+        creds = dict(mode=self.mode.get(),
+                     user=self.user_entry.get().strip(),
+                     password=self.pass_entry.get().strip())
         if not creds["user"] or not creds["password"]:
-            ttk.Messagebox.show_error("Please fill in both fields")
+            Messagebox.show_error("Please fill in both fields", title="Missing data")
             return
         self.start_chat_cb(creds)
 
 class ChatFrame(ttk.Frame):
-    """Main chat UI: history + entry."""
+    """Scrollable chat log + message entry."""
     def __init__(self, master, msg_q, send_q):
         super().__init__(master, padding=10)
         self.q, self.send_q = msg_q, send_q
 
         self.output = ScrolledText(self, bootstyle="dark", height=20, state="disabled")
-        self.output.pack(fill=BOTH, expand=YES, pady=(0,10))
+        self.output.pack(fill=BOTH, expand=YES, pady=(0, 10))
 
         self.entry = ttk.Entry(self)
         self.entry.pack(fill=X, side=LEFT, expand=YES)
@@ -139,8 +125,7 @@ class ChatFrame(ttk.Frame):
 
         ttk.Button(self, text="Send", command=self._send).pack(side=RIGHT, padx=5)
 
-        # poll queue every 100 ms
-        self.after(100, self._poll_q)
+        self.after(100, self._poll_q)  # poll queue every 100 ms
 
     def _poll_q(self):
         try:
@@ -152,48 +137,60 @@ class ChatFrame(ttk.Frame):
         self.after(100, self._poll_q)
 
     def _append(self, text: str, tag: str = "chat"):
-        txt = self.output.text            # the actual tk.Text widget
+        txt = self.output.text  # underlying tk.Text widget
         txt.configure(state="normal")
-
         if tag == "info":
             txt.insert(tk.END, f"[{text}]\n")
         else:
             txt.insert(tk.END, f"{text}\n")
-
         txt.configure(state="disabled")
         txt.yview_moveto(1.0)
 
-    def _send(self, event=None):
+    def _send(self, _=None):
         line = self.entry.get().strip()
         if line:
             self.send_q.put(line)
             self.entry.delete(0, END)
 
+# ────────────────────────── main window ──────────────────────────
 class App(ttk.Window):
     def __init__(self):
         super().__init__(title="ChatFlow")
         self.geometry("500x450")
-        self.style.theme_use("darkly")   # ttkbootstrap dark theme
-
+        self.style.theme_use("darkly")
         self.msg_q, self.send_q = queue.Queue(), queue.Queue()
         self._show_login()
+        self.after(100, self._pump)
 
     def _show_login(self):
-        self.login = LoginFrame(self, self._start_chat)
+        self.login = LoginFrame(self, self._connect)
         self.login.pack(fill=BOTH, expand=YES)
 
-    def _start_chat(self, creds):
-        # start networking thread
+    def _connect(self, creds):
+        for w in self.login.winfo_children():
+            w.configure(state="disabled")
         ChatClient(creds, self.msg_q, self.send_q).start()
-        # swap frames
-        self.login.destroy()
-        ChatFrame(self, self.msg_q, self.send_q).pack(fill=BOTH, expand=YES)
 
+    def _pump(self):
+        try:
+            while True:
+                typ, payload = self.msg_q.get_nowait()
+                if typ == "auth_ok":
+                    self.login.destroy()
+                    ChatFrame(self, self.msg_q, self.send_q).pack(fill=BOTH, expand=YES)
+                elif typ == "auth_err":
+                    Messagebox.show_error(payload, title="Auth failed")
+                    self.login.destroy()
+                    self._show_login()
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._pump)
+
+# ────────────────────────── entry point ──────────────────────────
 if __name__ == "__main__":
     try:
         App().mainloop()
     except Exception as e:
-        # graceful fallback to old CLI if Tk fails (e.g. missing DISPLAY)
         print("GUI failed, falling back to terminal:", e)
-        import client  # your original terminal client
-        client.main()
+        

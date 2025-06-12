@@ -1,3 +1,2 @@
-username,password
-solik,solik2007!
-moshe,moshe2009!
+username,pw_hash,password
+solik,,solik2007!
