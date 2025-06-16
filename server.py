@@ -27,6 +27,14 @@ def wrap_tls(sock: socket.socket) -> ssl.SSLSocket:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.verify_mode = ssl.CERT_OPTIONAL                    # ⇠ _no_ mutual TLS
     return ctx.wrap_socket(sock, server_side=True)
+def line_reader(sock: ssl.SSLSocket):
+    """Return a file-like object with .readline()."""
+    return sock.makefile("r", encoding="utf-8", newline="\n")
+
+def send_line(sock: ssl.SSLSocket, msg: str):
+    sock.sendall(f"{msg}\n".encode())
+
+bcast_lock = threading.Lock() 
 # ---------------------------------
 
 def recv_line(sock: ssl.SSLSocket) -> str:
