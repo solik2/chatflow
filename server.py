@@ -1,299 +1,239 @@
-# chatflow_csv_server.py
-import ssl, socket, threading, logging
-import pandas as pd
-import datetime
+#!/usr/bin/env python3
+"""
+ChatFlow LAN Server
+===================
+
+Key Points
+----------
+* Supports login or registration with a simple password rule (≥ 6 chars).
+* Persists users and chat history to CSV files for easy inspection.
+* Encrypts every payload using a shared Fernet key.
+* Uses one background thread per connected client.
+* All console debugging prints have been removed; internal events are
+  recorded via the ``logging`` module.
+"""
+
+from __future__ import annotations
+import socket
+import threading
+import logging
+import datetime as _dt
 import os
 import re
-import logging
+from typing import Optional, Dict
+
+import pandas as pd
 from cryptography.fernet import Fernet, InvalidToken
 
-# ------------------- configuration -------------------
-HOST = '192.168.1.63'
-PORT = 1234
-MAX_MSG_LEN = 1024       # hard socket read cap
-MAX_FIELD_LEN = 256      # individual field length cap
-USER_CSV = 'userdata.csv'
-CHAT_CSV = 'chathistory.csv'
-KEY_FILE = 'fernet.key'
-LOG_FILE = 'server.log'
-TLS_CERT = "tls/server.crt"
-TLS_KEY  = "tls/server.key"
-# -----------------------------------------------------
+# ────────────────────────────── Configuration ──────────────────────────────
+HOST, PORT        = "0.0.0.0", 1234
+MAX_MSG_LEN       = 1024                       # maximum bytes per TCP read
+MAX_FIELD_LEN     = 256                        # truncate oversized user input
+USER_CSV          = "userdata.csv"             # credential store
+CHAT_CSV          = "chathistory.csv"          # chat log
+KEY_FILE          = "fernet.key"               # shared encryption key
+LOG_FILE          = "server.log"               # server runtime log
+# ────────────────────────────────────────────────────────────────────────────
 
-# --------------------- logging -----------------------
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-# -----------------------------------------------------
 
-# ---------------- encryption key ---------------------
-def load_or_create_key() -> bytes:
-    try:
-        print("[DEBUG] Loading or creating encryption key")
-        if os.path.exists(KEY_FILE):
-            with open(KEY_FILE, 'rb') as kf:
-                key = kf.read()
-            # 44-byte urlsafe base64 key check
-            if len(key) == 44:
-                print("[DEBUG] Key loaded successfully")
-                return key
-            logging.warning("Invalid key length; regenerating.")
-        key = Fernet.generate_key()
-        with open(KEY_FILE, 'wb') as kf:
-            kf.write(key)
-        print("[DEBUG] New key generated and saved")
-        return key
-    except Exception as e:
-        logging.error(f"Key load/create error: {e}")
-        raise
+# ─────────────────────────────── Fernet Key ────────────────────────────────
+def _load_or_create_key() -> bytes:
+    """
+    Load an existing 44-byte Fernet key or create a new one on first run.
+    """
+    if os.path.exists(KEY_FILE):
+        key = open(KEY_FILE, "rb").read()
+        if len(key) == 44:
+            logging.info("Fernet key loaded")
+            return key
+        logging.warning("Invalid key length – regenerating")
+    key = Fernet.generate_key()
+    open(KEY_FILE, "wb").write(key)
+    logging.info("New Fernet key generated")
+    return key
 
-fernet = Fernet(load_or_create_key())
-# -----------------------------------------------------
 
-# ----------------- helpers: validation ---------------
-SPECIAL_RE = re.compile(r"[^\w]")
+fernet = Fernet(_load_or_create_key())
 
-def is_valid_username(name: str) -> bool:
-    return 0 < len(name) <= MAX_FIELD_LEN and name.isalnum()
+# ────────────────────────────── CSV Utilities ──────────────────────────────
+def _safe_csv(path: str, cols: list[str]) -> pd.DataFrame:
+    """
+    Ensure a CSV file exists with the expected columns; create a blank one
+    when missing or corrupted.
+    """
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        if list(df.columns) == cols:
+            return df
+        logging.warning("Corrupted %s – recreating", path)
+    df = pd.DataFrame(columns=cols)
+    df.to_csv(path, index=False)
+    return df
 
-def is_valid_password(pw: str) -> bool:
-    return (
-        len(pw) >= 8 and len(pw) <= MAX_FIELD_LEN and
-        SPECIAL_RE.search(pw) is not None
-    )
 
-def sanitize(text: str) -> str:
-    return re.sub(r"[^\w@\.\- ]", "", text)[:MAX_FIELD_LEN]
-# -----------------------------------------------------
+users_df  = _safe_csv(USER_CSV,  ["username", "password"])
+chat_df   = _safe_csv(CHAT_CSV,  ["timestamp", "user", "message"])
 
-# ------------- helpers: file & dataframe -------------
-def safe_csv_load(path: str, columns: list[str]) -> pd.DataFrame:
-    try:
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            if list(df.columns) == columns:
-                return df
-            logging.warning(f"{path} corrupted; recreating.")
-        raise ValueError
-    except Exception:
-        df = pd.DataFrame(columns=columns)
-        df.to_csv(path, index=False)
-        return df
+def _save_users() -> None:
+    """Persist the in-memory user table to disk."""
+    users_df.to_csv(USER_CSV, index=False)
 
-userdata_df = safe_csv_load(USER_CSV, ['username', 'password'])
-chathistory_df = safe_csv_load(CHAT_CSV, ['timestamp', 'user', 'message'])
-# -----------------------------------------------------
 
-# ---------------- encryption wrappers ----------------
-def create_tls_socket(base_sock: socket.socket) -> ssl.SSLSocket:
-    """Wrap accepted TCP socket with TLS."""
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(certfile="tls/server.crt",
-                            keyfile="tls/server.key")
-    return context.wrap_socket(base_sock, server_side=True)
+def _append_history(ts: _dt.datetime, user: str, msg: str) -> None:
+    """Add a line to the in-memory chat log and flush to disk."""
+    global chat_df
+    chat_df = pd.concat(
+        [chat_df,
+         pd.DataFrame([[ts, user, msg[:MAX_FIELD_LEN]]],
+                      columns=chat_df.columns)],
+        ignore_index=True)
+    chat_df.to_csv(CHAT_CSV, index=False)
 
-def start_server():
-    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    tcp.bind((HOST, PORT))
-    tcp.listen()
-    logging.info("TLS chat server listening on %s:%s …", HOST, PORT)
+# ─────────────────────────────– Helper Functions ───────────────────────────
+_sanitize = lambda t: re.sub(r"[^\w@\.\- ]", "", t)[:MAX_FIELD_LEN]
+_valid_user = lambda u: 0 < len(u) <= MAX_FIELD_LEN and u.isalnum()
+_valid_pw   = lambda p: 6 <= len(p) <= MAX_FIELD_LEN        # relaxed rule
 
-    while True:
-        conn, addr = tcp.accept()
-        try:
-            tls_conn = create_tls_socket(conn)      # ← TLS handshake here
-        except ssl.SSLError as e:
-            logging.warning("TLS handshake failed from %s: %s", addr, e)
-            conn.close()
-            continue
-        threading.Thread(target=handle_client,
-                         args=(tls_conn, addr),
-                         daemon=True).start()
-def decrypt_try(blob: bytes) -> bytes:
+
+def _decrypt_safe(blob: bytes) -> bytes:
+    """Try Fernet decryption; return b'' on failure."""
     try:
         return fernet.decrypt(blob)
     except (InvalidToken, ValueError):
-        return b''
+        return b""
 
-def recv_decoded(sock) -> str:
-    print("[DEBUG] Receiving data from socket")
+
+def _recv_line(sock: socket.socket) -> str:
+    """Read and decode a single encrypted line from client."""
     raw = sock.recv(MAX_MSG_LEN)
     if not raw:
-        print("[DEBUG] No data received")
-        return ''
-    plain = decrypt_try(raw) # fallback to plaintext
-    print(f"[DEBUG] Data received: {plain[:50]}...")
-    return plain.decode(errors='ignore')[:MAX_FIELD_LEN]
+        return ""
+    text = (_decrypt_safe(raw) or raw).decode(errors="ignore")
+    return text.strip()[:MAX_FIELD_LEN]
 
-# ---------- server.py ----------
-def send_plain(sock: socket.socket, msg: str) -> None:
-    """Send ONE logical message framed with '\n'."""
-    sock.sendall(f"{msg}".encode("utf-8"))
 
-# -----------------------------------------------------
+def _send_line(sock: socket.socket, text: str) -> None:
+    """Encrypt and send a single line to client."""
+    sock.sendall(fernet.encrypt(f"{text}\n".encode()))
 
-# ------------------ core functions -------------------
-def save_user_data():
-    userdata_df.to_csv(USER_CSV, index=False)
 
-def append_chat_history(timestamp, user, message):
-    global chathistory_df
-    if len(message) > MAX_FIELD_LEN:
-        message = message[:MAX_FIELD_LEN]
-    new_row = pd.DataFrame([[timestamp, user, message]],
-                           columns=['timestamp', 'user', 'message'])
-    chathistory_df = pd.concat([chathistory_df, new_row], ignore_index=True)
-    chathistory_df.to_csv(CHAT_CSV, index=False)
-
-def broadcast(msg: str, username: str = None):
-    if username:
-        msg = f"{username}: {msg}"
-    tagged = f"\n{datetime.datetime.now():%H:%M} | {msg}".encode()
-    for cli in list(clients.keys()):
+def _broadcast(text: str, sender: Optional[str] = None) -> None:
+    """
+    Send a message to every connected client.
+    If *sender* supplied, the string "sender: text" is broadcast.
+    """
+    if sender:
+        text = f"{sender}: {text}"
+    tagged = f"{_dt.datetime.now():%H:%M} | {text}"
+    for cli in list(clients):
         try:
-            cli.send(tagged)
-        except Exception as e:
-            logging.error(f"Broadcast to {clients.get(cli)} failed: {e}")
-# -----------------------------------------------------
+            _send_line(cli, tagged)
+        except OSError as exc:
+            logging.error("Broadcast failure: %s", exc)
+            cli.close()
+            clients.pop(cli, None)
 
-# --------------- networking / threading --------------
-
-base_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-base_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-base_sock.bind((HOST, PORT))
-base_sock.listen()
-# 2. TLS context (server-side)
-tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-tls_ctx.load_cert_chain(certfile=TLS_CERT, keyfile=TLS_KEY)
-clients: dict[socket.socket, str] = {}
-
-def handle_client(cli: socket.socket):
-    print("[DEBUG] Handling new client")
-    try:
-        username = clients.get(cli, 'Unknown')
-        while True:
-            decoded = recv_decoded(cli)
-            if not decoded:
-                print("[DEBUG] Client disconnected")
-                break
-
-            print(f"[DEBUG] Message from client: {decoded}")
-            append_chat_history(datetime.datetime.now(), username, decoded)
-
-            if decoded == 'File Transfer':
-                send_plain(cli, 'Send File Name')
-                filename = sanitize(recv_decoded(cli))
-                if not filename:
-                    send_plain(cli, 'Invalid filename')
-                    continue
-                send_plain(cli, 'Send File')
-
-                with open(filename, 'wb') as f:
-                    while True:
-                        chunk = cli.recv(MAX_MSG_LEN)
-                        if decrypt_try(chunk) == b'Completed':
-                            break
-                        f.write(decrypt_try(chunk) or chunk)
-                print(f"[DEBUG] File {filename} received")
-                continue
-
-            if ':' in decoded:
-                user, msg = map(str.strip, decoded.split(':', 1))
-            broadcast(decoded, username=username)
-    except Exception as e:
-        logging.error(f"Client handler error: {e}")
-    finally:
-        username = clients.pop(cli, 'Unknown')
-        broadcast(f"{username} left the chat!")
-        cli.close()
-        print("[DEBUG] Client handler closed")
-
-def login(username, password, cli) -> bool:
-    row = userdata_df[userdata_df['username'] == username]
+# ───────────────────────────── Authentication ──────────────────────────────
+def _login(user: str, pw: str, sock: socket.socket) -> bool:
+    row = users_df[users_df.username == user]
     if row.empty:
-        send_plain(cli, 'User does not exist')
+        _send_line(sock, "User does not exist")
         return False
-    if row.iloc[0]['password'] != password:
-        send_plain(cli, 'Incorrect Password')  # Send specific error message
+    if row.iloc[0].password != pw:
+        _send_line(sock, "Incorrect password")
         return False
     return True
 
-def register(username, password, cli) -> bool:
-    global userdata_df
-    if not (is_valid_username(username) and is_valid_password(password)):
-        send_plain(cli, 'Invalid registration data')
+
+def _register(user: str, pw: str, sock: socket.socket) -> bool:
+    global users_df
+    if not (_valid_user(user) and _valid_pw(pw)):
+        _send_line(sock, "Bad registration data")
         return False
-    if not userdata_df[userdata_df['username'] == username].empty:
-        send_plain(cli, 'User already exist')
+    if not users_df[users_df.username == user].empty:
+        _send_line(sock, "User already exists")
         return False
-    new_row = pd.DataFrame([[username, password]],
-                           columns=['username', 'password'])
-    userdata_df = pd.concat([userdata_df, new_row], ignore_index=True)
-    save_user_data()
-    send_plain(cli, 'Registration Successful')  # Added success message
+    users_df = pd.concat([users_df,
+                          pd.DataFrame([[user, pw]],
+                                       columns=["username", "password"])],
+                         ignore_index=True)
+    _save_users()
+    _send_line(sock, "Registration successful")
     return True
-# -----------------------------------------------------
 
-# ---------------------- main loop --------------------
-def handle_disconnection(client, addr):
-    logging.info(f"Client {addr} disconnected.")
-    client.close()
 
-def authenticate_client(client):
-    send_plain(client, 'Login or Reg')
+def _authenticate(sock: socket.socket) -> tuple[bool, Optional[str]]:
+    """
+    Interactively authenticate a client.
+    Returns (success_flag, username_or_None).
+    """
     while True:
-        mode = recv_decoded(client)
-        if mode.lower() in {'quit', 'exit'}:
-            return
+        _send_line(sock, "Login or Reg")
+        mode = _recv_line(sock)
+        if not mode:
+            return False, None
 
-        send_plain(client, 'USER')
-        username = sanitize(recv_decoded(client))
-        if username.lower() in {'quit', 'exit'}:
-            return
+        _send_line(sock, "USER")
+        user = _sanitize(_recv_line(sock))
 
-        send_plain(client, 'PW')
-        password = recv_decoded(client)
-        if password.lower() in {'quit', 'exit'}:
-            return
+        _send_line(sock, "PW")
+        pw = _recv_line(sock)
 
-        if mode == 'Login':
-            if login(username, password, client):
-                return True, username
-        elif mode == 'Register':
-            if register(username, password, client):
-                return True, username
-        else:
-            send_plain(client, 'Bad mode')
+        if mode == "Login" and _login(user, pw, sock):
+            return True, user
+        if mode == "Register" and _register(user, pw, sock):
+            return True, user
 
-        send_plain(client, 'Authentication Failed')
+        _send_line(sock, "Authentication failed")
+
+# ────────────────────────────── Client Thread ──────────────────────────────
+def _handle_client(sock: socket.socket) -> None:
+    """Serve a single authenticated client until disconnection."""
+    username = clients.get(sock, "?")
+    try:
+        while True:
+            msg = _recv_line(sock)
+            if not msg:
+                break
+            _append_history(_dt.datetime.now(), username, msg)
+            _broadcast(msg, sender=username)
+    except Exception as exc:                     # noqa: BLE001
+        logging.error("Handler error for %s: %s", username, exc)
+    finally:
+        sock.close()
+        clients.pop(sock, None)
+        _broadcast(f"{username} left the chat!")
+
+# ─────────────────────────────── Main Server ───────────────────────────────
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((HOST, PORT))
+server.listen()
+logging.info("Server listening on %s:%d", HOST, PORT)
+
+clients: Dict[socket.socket, str] = {}
 
 while True:
-    raw_cli, addr = base_sock.accept()       
-    try:
-        client = tls_ctx.wrap_socket(raw_cli, server_side=True)
-    except ssl.SSLError as e:
-        logging.warning("TLS handshake failed from %s: %s", addr, e)
-        raw_cli.close()
-        continue
-    logging.info("TLS chat server listening on %s:%s …", HOST, PORT)
-    authenticated, username = authenticate_client(client)
+    client_sock, addr = server.accept()
+    logging.info("Connection from %s:%d", *addr)
+
+    authenticated, user = _authenticate(client_sock)
     if not authenticated:
-        handle_disconnection(client, addr)
+        client_sock.close()
         continue
 
-    send_plain(client, 'Authenticated')
-    clients[client] = username
+    _send_line(client_sock, "Authenticated")
+    clients[client_sock] = user
 
-    # Send chat history to the new client
-    for _, r in chathistory_df.iterrows():
-        send_plain(client, f"\n{pd.to_datetime(r.timestamp):%H:%M} | {r.user} : {r.message}")
+    # send existing history to the newcomer
+    for _, row in chat_df.iterrows():
+        _send_line(client_sock,
+                   f"{pd.to_datetime(row.timestamp):%H:%M} | {row.user}: {row.message}")
 
-    broadcast(f"{username} joined the Chat!")
-    threading.Thread(target=handle_client, args=(client,), daemon=True).start()
-
-
+    _broadcast(f"{user} joined the chat!")
+    threading.Thread(target=_handle_client, args=(client_sock,), daemon=True).start()

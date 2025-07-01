@@ -1,103 +1,286 @@
 #!/usr/bin/env python3
 """
-Terminal-only ChatFlow client.
-Re-implements the old GUI logic using stdin/stdout and keeps the
-handshake that the server already understands:
+ChatFlow LAN Client
+===================
+Tkinter GUI client with Fernet-encrypted communication.
 
-  • Server → "Login or Reg"         → client sends "Login"/"Register"
-  • Server → "USER" / "PW" / "EMAIL"→ client replies with credentials
-  • Server → auth result strings    → client prints status
-
-After authentication every line you enter is sent as a chat message.
-Type  `exit`  or  `quit`  to close the connection.
+Key Points
+----------
+* Supports Login / Register flows and stays on the login screen until the
+  server returns “Authenticated”.
+* Runs a background receiver thread that remains alive after authentication
+  and allows reconnection attempts without restarting the program.
+* All console debugging prints have been removed; status messages are routed
+  to the GUI.
 """
 
-import argparse
-import getpass
+from __future__ import annotations
 import socket
 import threading
-import sys
+import queue
+from pathlib import Path
 
-BUF_SIZE = 1024
-HOST, PORT = "192.168.1.63", 1234
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import BOTH, YES, END, LEFT, RIGHT, W, X
+from ttkbootstrap.scrolled import ScrolledText
+from cryptography.fernet import Fernet, InvalidToken
 
-def recv_loop(sock, creds):
-    """Handle all server traffic in a background thread."""
-    while True:
+# ────────────────────────────── Configuration ──────────────────────────────
+HOST, PORT = "0.0.0.0", 1234
+KEY_FILE   = "fernet.key"              # must match the server key
+BUF_SIZE   = 4096
+# ────────────────────────────────────────────────────────────────────────────
+
+FERNET = Fernet(Path(KEY_FILE).read_bytes())
+
+# ───────────────────────────── Networking Thread ───────────────────────────
+class ChatClient(threading.Thread):
+    """
+    Background thread that manages a single login/chat session.
+
+    Queues
+    ------
+    msg_q  : GUI message queue – receives tuples:
+             ('info',  str)   – informational status line
+             ('auth_ok', '')  – authentication successful
+             ('auth_fail', r) – authentication error text
+             ('chat',   str)  – chat line from server
+    send_q : queue.Queue – outbound messages from the GUI
+    """
+    def __init__(self, creds: dict[str, str],
+                 msg_q: "queue.Queue[tuple[str, str]]",
+                 send_q: "queue.Queue[str]"):
+        super().__init__(daemon=True)
+        self.creds   = creds
+        self.msg_q   = msg_q
+        self.send_q  = send_q
+        self.sock    = socket.socket()
+        self.running = True
+        self.authenticated = False
+
+    # ──────────────── internal helpers ────────────────
+    def _send_token(self, text: str) -> None:
+        """Encrypt and send a line to the server."""
+        self.sock.sendall(FERNET.encrypt(text.encode()))
+
+    def _handle_prompt(self, prompt: str) -> bool:
+        """
+        Respond to server handshake prompts.
+        Returns True if the prompt was handled here.
+        """
+        if prompt == "Login or Reg":
+            self._send_token(self.creds["mode"])
+        elif prompt == "USER":
+            self._send_token(self.creds["user"])
+        elif prompt == "PW":
+            self._send_token(self.creds["password"])
+        else:
+            return False
+        return True
+
+    # ──────────────── main thread loop ────────────────
+    def run(self) -> None:
         try:
-            data = sock.recv(BUF_SIZE)
-            if not data:
-                print("[INFO] Disconnected by server.")
+            self.sock.connect((HOST, PORT))
+            self.msg_q.put(("info", f"Connected to {HOST}:{PORT}"))
+
+            # launch receiver on a sub-thread
+            threading.Thread(target=self._recv_loop, daemon=True).start()
+
+            # sender loop – active only after auth_ok
+            while self.running:
+                try:
+                    line = self.send_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if not self.authenticated:
+                    continue
+                if line.lower() in {"quit", "exit"}:
+                    break
+                self._send_token(line)
+        finally:
+            self.running = False
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.msg_q.put(("info", "Disconnected"))
+
+    # ──────────────── receiver loop ────────────────
+    def _recv_loop(self) -> None:
+        """Reads encrypted messages from the socket and pushes them to the GUI queue."""
+        while self.running:
+            try:
+                chunk = self.sock.recv(BUF_SIZE)
+                if not chunk:
+                    break
+                try:
+                    plain = FERNET.decrypt(chunk).decode().strip()
+                except InvalidToken:
+                    continue
+
+                for line in plain.splitlines():
+                    # handshake flow
+                    if self._handle_prompt(line):
+                        continue
+                    if line == "Authenticated":
+                        self.authenticated = True
+                        self.msg_q.put(("auth_ok", ""))
+                        continue
+                    if line.startswith(("Authentication failed",
+                                        "User does not exist",
+                                        "Incorrect password",
+                                        "Bad registration data",
+                                        "User already exists")):
+                        self.msg_q.put(("auth_fail", line))
+                        self.running = False
+                        return
+                    # normal chat
+                    self.msg_q.put(("chat", line))
+            except OSError:
                 break
+        self.running = False
 
-            msg = data.decode().strip()
-            if msg == "Login or Reg":
-                sock.sendall(creds["mode"].encode())
-            elif msg == "USER":
-                sock.sendall(creds["user"].encode())
-            elif msg == "PW":
-                sock.sendall(creds["password"].encode())
-            elif msg in ("Authenticated", "Registration Successful"):
-                print(f"[SUCCESS] {msg}")
-            elif msg == "Authentication Failed":
-                print("[ERROR] Authentication failed; closing client.")
-                sock.close()
-                sys.exit(1)
-            elif msg == "User does not exist":
-                print("[ERROR] The username you entered does not exist.")
-            elif msg == "Incorrect Password":
-                print("[ERROR] The password you entered is incorrect. Please try again.")
-                creds["password"] = getpass.getpass("Password: ").strip()
-                sock.sendall(creds["password"].encode())
-            elif msg == "Invalid registration data":
-                print("[ERROR] Registration failed due to invalid data. Please check your inputs.")
-            elif msg == "User already exist":
-                print("[ERROR] The username is already taken. Please choose a different one.")
-            elif msg == "Bad mode":
-                print("[ERROR] Invalid mode selected. Please restart the client and choose 'Login' or 'Register'.")
-            else:
-                # Display chat history or new chat messages
-                print(msg)
-        except Exception as exc:
-            print(f"[ERROR] {exc}")
-            break
+# ─────────────────────────────── GUI Frames ────────────────────────────────
+class LoginFrame(ttk.Frame):
+    """Login/Register screen; stays visible until authentication succeeds."""
+    def __init__(self, master: "App", on_success):
+        super().__init__(master, padding=30)
+        self.master   = master
+        self.on_success = on_success
+        self.msg_q, self.send_q = master.msg_q, master.send_q
+        self.client: ChatClient | None = None
 
+        # — header —
+        ttk.Label(self, text="ChatFlow",
+                  font=("Helvetica", 20, "bold")).pack(pady=10)
 
-def main():
-    ap = argparse.ArgumentParser(description="Terminal ChatFlow client")
-    ap.add_argument("--host", default="127.0.0.1", help="Server IP")
-    ap.add_argument("--port", type=int, default=1234, help="Server TCP port")
-    args = ap.parse_args()
+        # — mode selector —
+        self.mode = ttk.StringVar(value="Login")
+        ttk.Radiobutton(self, text="Login",    variable=self.mode, value="Login").pack(side=LEFT, padx=5)
+        ttk.Radiobutton(self, text="Register", variable=self.mode, value="Register").pack(side=LEFT)
 
-    # Interactive credential gathering
-    mode = input("Type Login or Register: ").strip().title()
-    while mode not in {"Login", "Register"}:
-        mode = input("Please enter exactly 'Login' or 'Register': ").strip().title()
+        # — credential fields —
+        self.user = ttk.Entry(self, width=25)
+        self.pwd  = ttk.Entry(self, width=25, show="*")
+        for label, widget in (("Username", self.user), ("Password", self.pwd)):
+            ttk.Label(self, text=label).pack(anchor=W, pady=(15, 0))
+            widget.pack(fill=X)
 
-    user = input("Username: ").strip()
-    password = getpass.getpass("Password: ").strip()
+        # — connect button & status —
+        self.btn = ttk.Button(self, text="Connect", command=self._connect)
+        self.btn.pack(pady=20)
+        self.status = ttk.Label(self, text="", bootstyle="danger")
+        self.status.pack()
 
-    creds = {"mode": mode, "user": user, "password": password}
+        self.after(100, self._poll_queue)
 
-    # Connect to server
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((HOST, PORT))
-    print(f"[INFO] Connected to {HOST}:{PORT}")
+    # ───────── internal helpers ─────────
+    def _set_status(self, txt: str, style: str = "danger") -> None:
+        self.status.configure(text=txt, bootstyle=style)
 
-    # Start receiver thread
-    threading.Thread(target=recv_loop, args=(sock, creds), daemon=True).start()
+    def _connect(self) -> None:
+        """Validate fields and start a new ChatClient thread."""
+        creds = {
+            "mode": self.mode.get(),
+            "user": self.user.get().strip(),
+            "password": self.pwd.get().strip()
+        }
+        if not creds["user"] or not creds["password"]:
+            self._set_status("All fields required")
+            return
 
-    # Sender loop
-    try:
-        while True:
-            line = input()
-            if line.lower() in {"exit", "quit"}:
-                break
-            sock.sendall(line.encode())
-    finally:
-        sock.close()
-        print("[INFO] Connection closed.")
+        # stop previous attempt if still running
+        if self.client and self.client.running:
+            self.client.running = False
+            try:
+                self.client.sock.close()
+            except OSError:
+                pass
 
+        self.client = ChatClient(creds, self.msg_q, self.send_q)
+        self.client.start()
+        self.btn.configure(state=ttk.DISABLED)
+        self._set_status("Connecting…", style="warning")
 
+    def _poll_queue(self) -> None:
+        """Handle authentication results coming from the worker thread."""
+        try:
+            while True:
+                tag, payload = self.msg_q.get_nowait()
+                if tag == "auth_ok":
+                    self.on_success()
+                    return
+                if tag == "auth_fail":
+                    self._set_status(payload)
+                    self.btn.configure(state=ttk.NORMAL)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+class ChatFrame(ttk.Frame):
+    """Main chat window, shown after successful login."""
+    def __init__(self, master: "App"):
+        super().__init__(master, padding=10)
+        self.msg_q, self.send_q = master.msg_q, master.send_q
+
+        # — scrollable chat output —
+        self.output = ScrolledText(self, bootstyle="dark", height=20, state="disabled")
+        self.output.pack(fill=BOTH, expand=YES, pady=(0, 10))
+
+        # — input line & send button —
+        self.entry = ttk.Entry(self)
+        self.entry.pack(fill=X, side=LEFT, expand=YES)
+        self.entry.bind("<Return>", self._send)
+        ttk.Button(self, text="Send", command=self._send).pack(side=RIGHT, padx=5)
+
+        self.after(100, self._poll_queue)
+
+    def _append(self, txt: str, tag: str) -> None:
+        """Write a line to the chat window."""
+        widget = self.output.text
+        widget.configure(state="normal")
+        widget.insert(ttk.END, f"[{txt}]\n" if tag == "info" else f"{txt}\n")
+        widget.configure(state="disabled")
+        widget.yview_moveto(1.0)
+
+    def _poll_queue(self) -> None:
+        """Display incoming chat and info lines."""
+        try:
+            while True:
+                tag, txt = self.msg_q.get_nowait()
+                if tag in {"chat", "info"}:
+                    self._append(txt, tag)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _send(self, *_):
+        """Place user input onto the outbound queue."""
+        line = self.entry.get().strip()
+        if line:
+            self.send_q.put(line)
+            self.entry.delete(0, END)
+
+# ───────────────────────────── Main Application ────────────────────────────
+class App(ttk.Window):
+    """Root Tk application window."""
+    def __init__(self):
+        super().__init__(title="ChatFlow")
+        self.geometry("520x460")
+        self.style.theme_use("darkly")
+        self.msg_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self.send_q: "queue.Queue[str]" = queue.Queue()
+        self._show_login()
+
+    def _show_login(self) -> None:
+        self.login = LoginFrame(self, self._show_chat)
+        self.login.pack(fill=BOTH, expand=YES)
+
+    def _show_chat(self) -> None:
+        self.login.destroy()
+        ChatFrame(self).pack(fill=BOTH, expand=YES)
+
+# ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    App().mainloop()
